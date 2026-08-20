@@ -2,21 +2,32 @@
 # =============================================================================
 # install-k3s-ha-server.sh — Install K3s Control Plane in HA mode (offline)
 #
-# Extends install-k3s-server.sh for multi-control-plane clusters backed by
-# an external etcd data store.  Run prepare-node.sh on the node first.
+# Supports TWO etcd backends:
 #
-# TWO MODES:
-#   --role first   → initialises the cluster (run once on first CP)
-#   --role additional → joins an existing CP (run on every subsequent CP)
+#   Option A — External etcd (dedicated etcd node):
+#     --datastore-endpoint http://192.168.64.30:2379
 #
-# Usage:
-#   # First control plane
+#   Option B — Embedded etcd (no dedicated etcd node):
+#     --embedded-etcd
+#
+# TWO ROLES:
+#   --role first       → initialises the cluster (run once on first CP)
+#   --role additional  → joins an existing CP (run on every subsequent CP)
+#
+# Usage (Option A — external etcd):
 #   sudo ./install-k3s-ha-server.sh --role first --node-ip 192.168.64.21 \
 #       --datastore-endpoint http://192.168.64.30:2379
 #
-#   # Additional control plane
 #   sudo ./install-k3s-ha-server.sh --role additional --node-ip 192.168.64.22 \
 #       --datastore-endpoint http://192.168.64.30:2379 \
+#       --cluster-token <TOKEN_FROM_FIRST_CP>
+#
+# Usage (Option B — embedded etcd):
+#   sudo ./install-k3s-ha-server.sh --role first --node-ip 192.168.64.21 \
+#       --embedded-etcd
+#
+#   sudo ./install-k3s-ha-server.sh --role additional --node-ip 192.168.64.22 \
+#       --embedded-etcd --server-ip 192.168.64.21 \
 #       --cluster-token <TOKEN_FROM_FIRST_CP>
 # =============================================================================
 set -euo pipefail
@@ -39,7 +50,9 @@ BUNDLE_PATH="/opt/offline-bundle"
 NODE_IP=""
 NODE_NAME=""                # defaults to hostname
 ROLE=""                     # "first" | "additional"
-DATASTORE_ENDPOINT=""       # etcd endpoint e.g. http://192.168.64.30:2379
+DATASTORE_ENDPOINT=""       # Option A: external etcd e.g. http://192.168.64.30:2379
+EMBEDDED_ETCD=false         # Option B: use K3s embedded etcd (--cluster-init)
+SERVER_IP=""                # Option B additional: IP of first CP to join
 CLUSTER_TOKEN=""            # required for --role additional
 LOAD_BALANCER_IP=""         # optional: VIP in front of control planes
 CLUSTER_CIDR="10.244.0.0/16"
@@ -76,15 +89,19 @@ usage() {
 ${BOLD}install-k3s-ha-server.sh${NC} — Install K3s control plane in HA mode (offline)
 
 ${BOLD}USAGE${NC}
-  sudo $0 --role <first|additional> --node-ip <IP> --datastore-endpoint <URL> [OPTIONS]
+  sudo $0 --role <first|additional> --node-ip <IP> [--datastore-endpoint URL | --embedded-etcd] [OPTIONS]
 
 ${BOLD}REQUIRED${NC}
   --role first|additional     'first' initialises the cluster; 'additional' joins it
   --node-ip IP                This node's IP address
-  --datastore-endpoint URL    etcd endpoint  (e.g. http://192.168.64.30:2379)
+
+${BOLD}ETCD BACKEND (choose one)${NC}
+  --datastore-endpoint URL    Option A: external etcd  (e.g. http://192.168.64.30:2379)
+  --embedded-etcd             Option B: K3s built-in embedded etcd (no separate etcd VM)
 
 ${BOLD}REQUIRED FOR --role additional${NC}
   --cluster-token TOKEN       Node join token from the first control plane
+  --server-ip IP              Option B only: IP of the first control plane to join
 
 ${BOLD}OPTIONS${NC}
   --node-name NAME            Unique K3s node name           (default: hostname)
@@ -96,30 +113,34 @@ ${BOLD}OPTIONS${NC}
   --dry-run                   Print commands without executing
   -h, --help                  Show this help
 
-${BOLD}EXAMPLES${NC}
-  # First control plane (initialise cluster)
+${BOLD}EXAMPLES — Option A (external etcd)${NC}
+  # First control plane
   sudo $0 --role first \\
     --node-ip 192.168.64.21 \\
     --datastore-endpoint http://192.168.64.30:2379 \\
     --load-balancer-ip 192.168.64.20
 
-  # Second control plane (join cluster)
+  # Second control plane
   sudo $0 --role additional \\
     --node-ip 192.168.64.22 \\
     --datastore-endpoint http://192.168.64.30:2379 \\
     --cluster-token 'K10xxx::server:yyy' \\
     --load-balancer-ip 192.168.64.20
 
-${BOLD}WORKFLOW${NC}
-  1. etcd node      → install + start etcd manually (see HA_CLUSTER_SETUP.md)
-  2. First CP       → sudo ./prepare-node.sh
-                      sudo ./install-k3s-ha-server.sh --role first ...
-  3. Additional CPs → sudo ./prepare-node.sh
-                      sudo ./install-k3s-ha-server.sh --role additional ...
-  4. Workers        → sudo ./prepare-node.sh
-                      sudo ./install-k3s-agent.sh --server-ip <LB_or_CP1_IP> ...
-  5. Cilium         → sudo ./install-cilium.sh --server-ip <LB_or_CP1_IP>
-  6. Validate       → sudo ./validate-cluster.sh
+${BOLD}EXAMPLES — Option B (embedded etcd, no dedicated etcd VM)${NC}
+  # First control plane — bootstraps embedded etcd cluster
+  sudo $0 --role first \\
+    --node-ip 192.168.64.21 \\
+    --embedded-etcd \\
+    --load-balancer-ip 192.168.64.20
+
+  # Second control plane — joins embedded etcd cluster via first CP
+  sudo $0 --role additional \\
+    --node-ip 192.168.64.22 \\
+    --embedded-etcd \\
+    --server-ip 192.168.64.21 \\
+    --cluster-token 'K10xxx::server:yyy' \\
+    --load-balancer-ip 192.168.64.20
 EOF
 }
 
@@ -132,6 +153,8 @@ while [[ $# -gt 0 ]]; do
         --node-ip)             NODE_IP="${2:?--node-ip requires a value}"; shift 2 ;;
         --node-name)           NODE_NAME="${2:?--node-name requires a value}"; shift 2 ;;
         --datastore-endpoint)  DATASTORE_ENDPOINT="${2:?--datastore-endpoint requires a value}"; shift 2 ;;
+        --embedded-etcd)       EMBEDDED_ETCD=true; shift ;;
+        --server-ip)           SERVER_IP="${2:?--server-ip requires a value}"; shift 2 ;;
         --cluster-token)       CLUSTER_TOKEN="${2:?--cluster-token requires a value}"; shift 2 ;;
         --load-balancer-ip)    LOAD_BALANCER_IP="${2:?--load-balancer-ip requires a value}"; shift 2 ;;
         --cluster-cidr)        CLUSTER_CIDR="${2:?}"; shift 2 ;;
@@ -150,15 +173,34 @@ done
 mkdir -p "${LOG_DIR}"
 touch "${LOG_FILE}"
 
-[[ $EUID -eq 0 ]]              || { log_error "Run as root: sudo $0"; exit 1; }
-[[ -n "${NODE_IP}" ]]          || { log_error "--node-ip is required"; usage; exit 1; }
-[[ -n "${ROLE}" ]]             || { log_error "--role is required (first|additional)"; usage; exit 1; }
-[[ -n "${DATASTORE_ENDPOINT}" ]] || { log_error "--datastore-endpoint is required"; usage; exit 1; }
+[[ $EUID -eq 0 ]]     || { log_error "Run as root: sudo $0"; exit 1; }
+[[ -n "${NODE_IP}" ]] || { log_error "--node-ip is required"; usage; exit 1; }
+[[ -n "${ROLE}" ]]    || { log_error "--role is required (first|additional)"; usage; exit 1; }
 
 [[ "${ROLE}" == "first" || "${ROLE}" == "additional" ]] || {
     log_error "--role must be 'first' or 'additional', got: '${ROLE}'"
     exit 1
 }
+
+# Exactly one etcd backend must be chosen
+if [[ "${EMBEDDED_ETCD}" == "false" && -z "${DATASTORE_ENDPOINT}" ]]; then
+    log_error "Specify an etcd backend:"
+    log_error "  Option A (external etcd): --datastore-endpoint http://<etcd-ip>:2379"
+    log_error "  Option B (embedded etcd): --embedded-etcd"
+    usage; exit 1
+fi
+
+if [[ "${EMBEDDED_ETCD}" == "true" && -n "${DATASTORE_ENDPOINT}" ]]; then
+    log_error "--embedded-etcd and --datastore-endpoint are mutually exclusive"
+    exit 1
+fi
+
+# Embedded etcd additional CP requires --server-ip to know which CP to join
+if [[ "${EMBEDDED_ETCD}" == "true" && "${ROLE}" == "additional" && -z "${SERVER_IP}" ]]; then
+    log_error "--server-ip is required for --embedded-etcd --role additional"
+    log_error "Set it to the IP of the first control plane (e.g. --server-ip 192.168.64.21)"
+    exit 1
+fi
 
 if [[ "${ROLE}" == "additional" && -z "${CLUSTER_TOKEN}" ]]; then
     log_error "--cluster-token is required when --role is 'additional'"
@@ -201,45 +243,71 @@ verify_bundle() {
 }
 
 # =============================================================================
-# 2. Verify etcd is reachable
+# 2. Verify etcd is reachable (Option A only — skipped for embedded etcd)
 # =============================================================================
 verify_etcd() {
+    if [[ "${EMBEDDED_ETCD}" == "true" ]]; then
+        log_step "etcd Backend: Embedded (K3s built-in) — skipping external etcd check"
+        if [[ "${ROLE}" == "first" ]]; then
+            log_ok "First CP will bootstrap embedded etcd cluster via --cluster-init"
+        else
+            log_ok "Additional CP will join embedded etcd cluster via --server https://${SERVER_IP}:6443"
+        fi
+        return
+    fi
+
     log_step "Verifying etcd Data Store (${DATASTORE_ENDPOINT})"
 
-    local etcd_url="${DATASTORE_ENDPOINT}/health"
+    # DATASTORE_ENDPOINT may be a single URL or a comma-separated list
+    # (multi-node etcd cluster, e.g. http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379).
+    # Only one member needs to answer here — K3s's own etcd client handles
+    # failover across all listed members at runtime.
+    local etcd_endpoints
+    IFS=',' read -ra etcd_endpoints <<< "${DATASTORE_ENDPOINT}"
+
     local retries=5
     local wait_s=3
     local etcd_ok=false
+    local healthy_ep=""
 
     for ((i=1; i<=retries; i++)); do
-        local resp
-        resp="$(curl -s --connect-timeout 5 "${etcd_url}" 2>/dev/null || true)"
-        if echo "${resp}" | grep -q '"health":"true"\|"health": "true"'; then
-            etcd_ok=true
-            break
-        fi
+        for ep in "${etcd_endpoints[@]}"; do
+            local resp
+            resp="$(curl -s --connect-timeout 5 "${ep}/health" 2>/dev/null || true)"
+            if echo "${resp}" | grep -q '"health":"true"\|"health": "true"'; then
+                etcd_ok=true
+                healthy_ep="${ep}"
+                break 2
+            fi
+        done
         log_info "  etcd not reachable yet (attempt ${i}/${retries}) — retrying in ${wait_s}s..."
         [[ ${i} -lt ${retries} ]] && sleep "${wait_s}"
     done
 
     if ! ${etcd_ok}; then
-        log_warn "etcd health check did not confirm 'healthy' — checking TCP connectivity..."
+        log_warn "etcd health check did not confirm 'healthy' on any endpoint — checking TCP connectivity..."
 
-        # Extract host and port from endpoint URL
-        local etcd_host; etcd_host="$(echo "${DATASTORE_ENDPOINT}" | sed 's|http[s]*://||' | cut -d: -f1)"
-        local etcd_port; etcd_port="$(echo "${DATASTORE_ENDPOINT}" | sed 's|http[s]*://||' | cut -d: -f2)"
+        local tcp_ok=false
+        for ep in "${etcd_endpoints[@]}"; do
+            local etcd_host; etcd_host="$(echo "${ep}" | sed 's|http[s]*://||' | cut -d: -f1)"
+            local etcd_port; etcd_port="$(echo "${ep}" | sed 's|http[s]*://||' | cut -d: -f2)"
 
-        if timeout 5 bash -c ">/dev/tcp/${etcd_host}/${etcd_port}" 2>/dev/null; then
-            log_warn "TCP to etcd is open — etcd may be starting. Proceeding."
-        else
-            log_error "Cannot reach etcd at ${DATASTORE_ENDPOINT}"
-            log_error "Ensure etcd is running on the etcd node:"
+            if timeout 5 bash -c ">/dev/tcp/${etcd_host}/${etcd_port}" 2>/dev/null; then
+                log_warn "TCP to ${ep} is open — etcd may be starting. Proceeding."
+                tcp_ok=true
+                break
+            fi
+        done
+
+        ${tcp_ok} || {
+            log_error "Cannot reach etcd at any of: ${DATASTORE_ENDPOINT}"
+            log_error "Ensure etcd is running on the etcd node(s):"
             log_error "  sudo systemctl status etcd"
             log_error "  sudo systemctl start etcd"
             exit 1
-        fi
+        }
     else
-        log_ok "etcd is healthy at ${DATASTORE_ENDPOINT}"
+        log_ok "etcd is healthy at ${healthy_ep}"
     fi
 }
 
@@ -316,12 +384,16 @@ install_k3s_ha_server() {
     fi
 
     step_done "ha-server-install" && { log_info "K3s HA install already completed, skipping."; return; }
-    log_step "Installing K3s Control Plane (role: ${ROLE})"
+
+    local etcd_mode; [[ "${EMBEDDED_ETCD}" == "true" ]] && etcd_mode="embedded" || etcd_mode="external"
+    log_step "Installing K3s Control Plane (role: ${ROLE}, etcd: ${etcd_mode})"
 
     log_info "Role              : ${ROLE}"
     log_info "Node IP           : ${NODE_IP}"
     log_info "Node Name         : ${NODE_NAME}"
-    log_info "Data Store        : ${DATASTORE_ENDPOINT}"
+    log_info "etcd Backend      : ${etcd_mode}"
+    [[ "${EMBEDDED_ETCD}" == "false" ]] && log_info "Data Store        : ${DATASTORE_ENDPOINT}"
+    [[ "${EMBEDDED_ETCD}" == "true" && "${ROLE}" == "additional" ]] && log_info "Join Server       : https://${SERVER_IP}:6443"
     log_info "Load Balancer IP  : ${LOAD_BALANCER_IP:-<none>}"
     log_info "Cluster CIDR      : ${CLUSTER_CIDR}"
     log_info "Service CIDR      : ${SERVICE_CIDR}"
@@ -349,34 +421,87 @@ install_k3s_ha_server() {
         log_info "TLS SAN           : ${NODE_IP}, ${LOAD_BALANCER_IP}"
     fi
 
-    log_debug "K3s exec flags: ${k3s_exec_flags[*]}"
+    # ── Option B: embedded etcd ───────────────────────────────────────────────
+    if [[ "${EMBEDDED_ETCD}" == "true" ]]; then
+        if [[ "${ROLE}" == "first" ]]; then
+            # --cluster-init bootstraps a new embedded etcd cluster
+            k3s_exec_flags+=("--cluster-init")
+            log_info "Bootstrapping new embedded etcd cluster (--cluster-init)"
+        else
+            # Additional CP joins via the first CP's API server
+            k3s_exec_flags+=("--server=https://${SERVER_IP}:6443")
+            log_info "Joining embedded etcd cluster via https://${SERVER_IP}:6443"
+        fi
 
-    # Build environment for install.sh
-    local install_env=(
-        INSTALL_K3S_SKIP_DOWNLOAD=true
-        INSTALL_K3S_BIN_DIR=/usr/local/bin
-        "INSTALL_K3S_EXEC=${k3s_exec_flags[*]}"
-        "K3S_DATASTORE_ENDPOINT=${DATASTORE_ENDPOINT}"
-        "K3S_NODE_IP=${NODE_IP}"
-    )
+        local install_env=(
+            INSTALL_K3S_SKIP_DOWNLOAD=true
+            INSTALL_K3S_BIN_DIR=/usr/local/bin
+            "INSTALL_K3S_EXEC=${k3s_exec_flags[*]}"
+            "K3S_NODE_IP=${NODE_IP}"
+            "K3S_TOKEN=${CLUSTER_TOKEN:-}"
+        )
 
-    # Additional control planes need the cluster token to authenticate
-    if [[ "${ROLE}" == "additional" ]]; then
-        install_env+=("K3S_TOKEN=${CLUSTER_TOKEN}")
-        log_info "Joining existing HA cluster using provided token"
+    # ── Option A: external etcd ───────────────────────────────────────────────
     else
-        log_info "Initialising new HA cluster (first control plane)"
+        local install_env=(
+            INSTALL_K3S_SKIP_DOWNLOAD=true
+            INSTALL_K3S_BIN_DIR=/usr/local/bin
+            "INSTALL_K3S_EXEC=${k3s_exec_flags[*]}"
+            "K3S_DATASTORE_ENDPOINT=${DATASTORE_ENDPOINT}"
+            "K3S_NODE_IP=${NODE_IP}"
+        )
+
+        if [[ "${ROLE}" == "additional" ]]; then
+            install_env+=("K3S_TOKEN=${CLUSTER_TOKEN}")
+            log_info "Joining existing HA cluster using provided token"
+        else
+            log_info "Initialising new HA cluster (first control plane)"
+        fi
     fi
+
+    log_debug "K3s exec flags: ${k3s_exec_flags[*]}"
 
     env "${install_env[@]}" \
         bash "${BUNDLE_PATH}/binaries/install.sh" 2>&1 | tee -a "${LOG_FILE}"
 
-    mark_done "ha-server-install"
-    log_ok "K3s HA server installation complete"
+    # NOTE: mark_done for "ha-server-install" happens in wait_for_k3s, not here.
+    # install.sh only installs + starts the systemd unit — it returns 0 even if
+    # k3s then crash-loops. Marking done here caused re-runs to silently skip
+    # a broken install and just time out waiting for an API server that was
+    # never actually (re)started.
+    log_ok "K3s installer finished — waiting for the API server to confirm health"
 }
 
 # =============================================================================
-# 6. Wait for K3s API server to be healthy
+# 6. Diagnostics — dump service state + known-cause hints on failure
+# =============================================================================
+dump_k3s_diagnostics() {
+    log_error "── systemctl status k3s ──"
+    systemctl status k3s --no-pager 2>&1 | tee -a "${LOG_FILE}" >&2 || true
+
+    log_error "── journalctl -u k3s (last 50 lines) ──"
+    local journal
+    journal="$(journalctl -u k3s --no-pager -n 50 2>&1 || true)"
+    echo "${journal}" | tee -a "${LOG_FILE}" >&2
+
+    if echo "${journal}" | grep -q 'SEGV\|code=killed'; then
+        log_error "Detected a crashed (SIGSEGV) k3s process."
+        log_error "This is almost always stale/corrupted local state from a previous failed install — not hardware."
+        log_error "Fix:"
+        log_error "  sudo rm -rf /var/lib/rancher/k3s /etc/rancher/k3s"
+        log_error "  sudo rm -f ${STEP_FILE}"
+        log_error "  then re-run this script"
+    elif echo "${journal}" | grep -q 'bootstrap data already found'; then
+        log_error "Detected mismatched bootstrap data in the etcd datastore."
+        log_error "etcd already holds cluster data encrypted with a different token than this install used."
+        log_error "Fix (run on the etcd node — do NOT hand-run 'rm -rf .../*', it silently no-ops under sudo):"
+        log_error "  sudo ./rollback.sh --etcd --force"
+        log_error "  then re-run this script"
+    fi
+}
+
+# =============================================================================
+# 7. Wait for K3s API server to be healthy
 # =============================================================================
 wait_for_k3s() {
     log_step "Waiting for K3s API Server"
@@ -387,27 +512,38 @@ wait_for_k3s() {
     local timeout=300
     local elapsed=15
     local interval=5
+    local max_restarts=5
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
     while [[ ${elapsed} -lt ${timeout} ]]; do
         # Try to get nodes with kubectl — works if API is responsive
         if kubectl get nodes &>/dev/null; then
             log_ok "K3s API server is responsive (${elapsed}s)"
+            step_done "ha-server-install" || mark_done "ha-server-install"
             return 0
         fi
+
+        # Bail early if the service is crash-looping instead of burning the full timeout
+        local restarts
+        restarts="$(systemctl show k3s -p NRestarts --value 2>/dev/null || echo 0)"
+        if [[ "${restarts}" =~ ^[0-9]+$ ]] && [[ "${restarts}" -ge "${max_restarts}" ]]; then
+            log_error "k3s.service has restarted ${restarts} times — it is crash-looping, not just slow to start."
+            dump_k3s_diagnostics
+            exit 1
+        fi
+
         log_info "  Waiting for API server... (${elapsed}s/${timeout}s)"
         sleep "${interval}"
         elapsed=$((elapsed + interval))
     done
 
     log_error "K3s API server did not become responsive within ${timeout}s"
-    log_error "Check service: systemctl status k3s"
-    log_error "Check logs: journalctl -u k3s --no-pager -n 50"
+    dump_k3s_diagnostics
     exit 1
 }
 
 # =============================================================================
-# 7. Configure kubectl
+# 8. Configure kubectl
 # =============================================================================
 configure_kubectl() {
     step_done "ha-kubectl-config" && { log_info "kubectl already configured, skipping."; return; }
@@ -469,7 +605,7 @@ PROFILE
 }
 
 # =============================================================================
-# 8. Verify node joined cluster
+# 9. Verify node joined cluster
 # =============================================================================
 verify_node_joined() {
     log_step "Verifying Control Plane Node Joined Cluster"
@@ -504,7 +640,7 @@ verify_node_joined() {
 }
 
 # =============================================================================
-# 9. Output join information
+# 10. Output join information
 # =============================================================================
 output_join_info() {
     log_step "Cluster Join Information"
@@ -531,11 +667,20 @@ output_join_info() {
         echo -e "  ${CYAN}${token}${NC}"
         echo ""
         echo -e "  ${BOLD}Add another control plane:${NC}"
-        echo -e "  ${YELLOW}sudo ./install-k3s-ha-server.sh \\${NC}"
-        echo -e "  ${YELLOW}    --role additional \\${NC}"
-        echo -e "  ${YELLOW}    --node-ip <NEW_CP_IP> \\${NC}"
-        echo -e "  ${YELLOW}    --datastore-endpoint ${DATASTORE_ENDPOINT} \\${NC}"
-        echo -e "  ${YELLOW}    --cluster-token '${token}'${NC}"
+        if [[ "${EMBEDDED_ETCD}" == "true" ]]; then
+            echo -e "  ${YELLOW}sudo ./install-k3s-ha-server.sh \\${NC}"
+            echo -e "  ${YELLOW}    --role additional \\${NC}"
+            echo -e "  ${YELLOW}    --node-ip <NEW_CP_IP> \\${NC}"
+            echo -e "  ${YELLOW}    --embedded-etcd \\${NC}"
+            echo -e "  ${YELLOW}    --server-ip ${NODE_IP} \\${NC}"
+            echo -e "  ${YELLOW}    --cluster-token '${token}'${NC}"
+        else
+            echo -e "  ${YELLOW}sudo ./install-k3s-ha-server.sh \\${NC}"
+            echo -e "  ${YELLOW}    --role additional \\${NC}"
+            echo -e "  ${YELLOW}    --node-ip <NEW_CP_IP> \\${NC}"
+            echo -e "  ${YELLOW}    --datastore-endpoint ${DATASTORE_ENDPOINT} \\${NC}"
+            echo -e "  ${YELLOW}    --cluster-token '${token}'${NC}"
+        fi
         echo ""
         echo -e "  ${BOLD}Add worker nodes:${NC}"
         echo -e "  ${YELLOW}sudo ./install-k3s-agent.sh \\${NC}"
@@ -563,7 +708,8 @@ main() {
     echo "  │   Cilium + WireGuard — Offline Bundle         │"
     echo "  └───────────────────────────────────────────────┘"
     echo -e "${NC}"
-    echo -e "  Role: ${BOLD}${ROLE}${NC} control plane"
+    local etcd_mode; [[ "${EMBEDDED_ETCD}" == "true" ]] && etcd_mode="embedded etcd" || etcd_mode="external etcd"
+    echo -e "  Role: ${BOLD}${ROLE}${NC} control plane  |  etcd: ${BOLD}${etcd_mode}${NC}"
     echo ""
 
     verify_bundle

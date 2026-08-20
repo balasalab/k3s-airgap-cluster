@@ -13,6 +13,7 @@ All steps use the automation scripts in `scripts/`. No manual etcd or K3s setup 
 
 ## Table of Contents
 
+### Option A — External etcd (Dedicated etcd Node)
 1. [Architecture](#architecture)
 2. [Pre-Requirements](#pre-requirements)
 3. [Port & Firewall Requirements](#port--firewall-requirements)
@@ -30,6 +31,33 @@ All steps use the automation scripts in `scripts/`. No manual etcd or K3s setup 
 15. [Troubleshooting](#troubleshooting)
 16. [Rollback](#rollback)
 17. [Quick Reference Card](#quick-reference-card)
+
+### Option B — Embedded etcd (No Dedicated etcd Node)
+18. [Option B: Architecture](#option-b-architecture)
+19. [Option B: VM Requirements](#option-b-vm-requirements)
+20. [Option B: Phase 1 — Distribute Bundle](#option-b-phase-1--distribute-bundle)
+21. [Option B: Phase 2 — Prepare All Nodes](#option-b-phase-2--prepare-all-nodes)
+22. [Option B: Phase 3 — Install First Control Plane](#option-b-phase-3--install-first-control-plane-cp-1-cluster-init)
+23. [Option B: Phase 4 — Install Second Control Plane](#option-b-phase-4--install-second-control-plane-cp-2)
+24. [Option B: Phase 5 — Set Up Load Balancer](#option-b-phase-5--set-up-load-balancer-optional)
+25. [Option B: Phase 6 — Install Worker Nodes](#option-b-phase-6--install-worker-nodes)
+26. [Option B: Phase 7 — Install Cilium CNI + WireGuard](#option-b-phase-7--install-cilium-cni--wireguard)
+27. [Option B: Phase 8 — Validate Cluster](#option-b-phase-8--validate-cluster)
+28. [Option B: Embedded etcd Backup and Restore](#option-b-embedded-etcd-backup-and-restore)
+29. [Option B: Quick Reference Card](#option-b-quick-reference-card)
+
+---
+
+### Which Option Should I Use?
+
+| | Option A — External etcd | Option B — Embedded etcd |
+|---|---|---|
+| **VMs required** | 7 (1 etcd + 2 CP + 1 LB + 3 workers) | 6 (2 CP + 1 LB + 3 workers) |
+| **etcd management** | Separate, dedicated VM | Built into K3s control planes |
+| **Complexity** | Higher — etcd managed separately | Lower — no etcd VM to maintain |
+| **Backup** | Manual `etcdctl snapshot` | Built-in `k3s etcd-snapshot` |
+| **Best for** | Production — full control over etcd | Labs / smaller deployments |
+| **Failure isolation** | etcd and K3s failures are independent | etcd tied to CP node lifecycle |
 
 ---
 
@@ -355,6 +383,71 @@ curl http://192.168.64.30:2379/health
 
 ---
 
+### Multi-Node etcd Cluster (3 Nodes — Recommended for Production)
+
+> The single-node etcd above is a single point of failure — if that VM goes
+> down, the **entire** K3s cluster loses its datastore and stops functioning,
+> regardless of how many control planes you have running. A 3-node etcd
+> cluster tolerates one node failure with zero cluster downtime.
+
+**Requirements:**
+- **Always use an odd number of etcd nodes** (3, or 5 for larger clusters).
+  etcd uses Raft consensus and needs a majority quorum to accept writes —
+  2 nodes is *worse* than 1, since losing either one breaks the majority.
+- Each node needs the offline bundle and open ports `2379` (client) and
+  `2380` (peer, node-to-node only — see
+  [Port & Firewall Requirements](#port--firewall-requirements)).
+
+**Run on each of the 3 etcd VMs**, using the *same* `--initial-cluster`
+value (all three peer URLs) on every node — only `--node-ip` and
+`--node-name` change:
+
+```bash
+# On etcd-1 (192.168.64.30)
+sudo ./install-etcd.sh --node-ip 192.168.64.30 --node-name etcd-1 \
+  --initial-cluster "etcd-1=http://192.168.64.30:2380,etcd-2=http://192.168.64.31:2380,etcd-3=http://192.168.64.32:2380"
+
+# On etcd-2 (192.168.64.31)
+sudo ./install-etcd.sh --node-ip 192.168.64.31 --node-name etcd-2 \
+  --initial-cluster "etcd-1=http://192.168.64.30:2380,etcd-2=http://192.168.64.31:2380,etcd-3=http://192.168.64.32:2380"
+
+# On etcd-3 (192.168.64.32)
+sudo ./install-etcd.sh --node-ip 192.168.64.32 --node-name etcd-3 \
+  --initial-cluster "etcd-1=http://192.168.64.30:2380,etcd-2=http://192.168.64.31:2380,etcd-3=http://192.168.64.32:2380"
+```
+
+> Run all three install commands within a couple of minutes of each other —
+> etcd's initial bootstrap expects the whole quorum to come up together. If
+> a node lags too far behind or fails to join, wipe just that node
+> (`sudo ./rollback.sh --etcd --force`) and re-run its install command.
+
+**Verify the cluster formed correctly:**
+```bash
+ETCDCTL_API=3 etcdctl \
+  --endpoints=http://192.168.64.30:2379,http://192.168.64.31:2379,http://192.168.64.32:2379 \
+  member list -w table
+# All 3 members should show STATUS=started
+```
+
+**Use with `install-k3s-ha-server.sh`** — pass all three endpoints as a
+comma-separated list to `--datastore-endpoint`. K3s's etcd client fails over
+across whichever members are alive on its own; no separate load balancer is
+needed for etcd traffic:
+
+```bash
+sudo ./install-k3s-ha-server.sh \
+  --role first \
+  --node-ip <CONTROL_PLANE_IP> \
+  --datastore-endpoint http://192.168.64.30:2379,http://192.168.64.31:2379,http://192.168.64.32:2379
+```
+
+**Failure behavior:** with 3 nodes, any single etcd VM can go down and the
+cluster keeps serving reads and writes — Raft still has a 2-of-3 majority.
+Losing 2 of 3 takes the datastore down (same as losing the only node in a
+single-node setup), since there's no longer a quorum.
+
+---
+
 ## Phase 4 — Install First Control Plane (cp-1)
 
 > Run on **cp-1** (192.168.64.21) only.
@@ -463,6 +556,11 @@ sudo ./install-k3s-ha-server.sh \
   cp-1   NotReady   control-plane,master   5m
   cp-2   NotReady   control-plane,master   30s
 ```
+
+> **Note:** while cp-2 joins, `systemctl status k3s` on cp-1 may briefly show
+> `activating (auto-restart)` for a few seconds. This is cp-1 reconciling its
+> peer/tunnel connections to the new control plane, not a failure — it
+> settles into `active (running)` on its own within seconds.
 
 **Verify both control planes on cp-1:**
 ```bash
@@ -748,10 +846,38 @@ sudo chown -R etcd:etcd /var/lib/etcd
 # 2. Port already in use
 sudo ss -tlnp | grep 2379
 
-# 3. Stale data from previous run
+# 3. Stale data from previous run — use rollback.sh, not a hand-rolled rm -rf.
+#    (see "etcd data wipe silently does nothing" below for why)
+sudo ./rollback.sh --etcd --force
+```
+
+### etcd data wipe silently does nothing
+
+```bash
+# DO NOT run this directly in an interactive shell:
+sudo rm -rf /var/lib/etcd/*        # ← looks fine, but is a no-op in practice
+
+# Why: `/var/lib/etcd` is 750 etcd:etcd. Bash expands the `*` glob using YOUR
+# (non-root) shell permissions BEFORE sudo elevates the command. If your user
+# can't list the directory, the glob matches nothing and bash passes the
+# literal string "/var/lib/etcd/*" to rm — which finds no such file and does
+# nothing. etcd then restarts and reloads its untouched data, making a wipe
+# look like it "didn't work" for no obvious reason.
+
+# Fix — either use the automated rollback (preferred, runs fully as root):
+sudo ./rollback.sh --etcd --force
+
+# ...or if wiping by hand, run the glob expansion inside a root shell:
 sudo systemctl stop etcd
-sudo rm -rf /var/lib/etcd/*
+sudo sh -c 'rm -rf /var/lib/etcd/*'
+sudo chown -R etcd:etcd /var/lib/etcd
+sudo chmod 750 /var/lib/etcd
 sudo systemctl start etcd
+
+# Verify it's actually empty afterward (also needs a root shell, same reason):
+sudo sh -c 'ls -la /var/lib/etcd/member/wal/' 2>&1
+ETCDCTL_API=3 etcdctl --endpoints=http://<etcd-ip>:2379 get /registry --prefix --keys-only
+# ↑ should print nothing
 ```
 
 ### cp-2 fails to connect to etcd
@@ -767,6 +893,64 @@ nc -zv 192.168.64.30 2379
 # On etcd VM — check it is listening on 0.0.0.0 (not just localhost)
 sudo ss -tlnp | grep 2379
 # Should show: *:2379 (0.0.0.0)
+```
+
+### K3s server crash-loops with SIGSEGV
+
+```bash
+sudo systemctl status k3s --no-pager
+# Active: activating (auto-restart) (Result: exit-code)
+# Main PID: ... status=11/SEGV
+
+sudo journalctl -u k3s --no-pager -n 50
+# k3s.service: Main process exited, code=killed, status=11/SEGV
+# k3s.service: Scheduled restart job, restart counter is at N.
+```
+
+**This is almost never the binary, the kernel, or hardware.** Before assuming
+either of those, compare the bundle's `k3s` binary checksum against a known-
+good copy (`sha256sum /opt/offline-bundle/binaries/k3s`) — if it matches,
+corruption is ruled out.
+
+The actual cause is nearly always **stale/corrupted local state** left behind
+in `/var/lib/rancher/k3s` from an earlier crashed or interrupted install —
+partially-written certs, TLS secrets, or bootstrap data from a previous
+attempt that never finished cleanly. A completely clean, isolated test run
+(fresh `--data-dir`, no reuse of `/var/lib/rancher/k3s`) will succeed even
+when the real systemd-managed install keeps segfaulting, which confirms it.
+
+**Fix:**
+```bash
+sudo systemctl stop k3s
+sudo rm -rf /var/lib/rancher/k3s /etc/rancher/k3s
+sudo rm -f /var/log/k3s-install/.ha-server-steps
+sudo ./install-k3s-ha-server.sh --role <first|additional> ...   # re-run with original flags
+```
+
+### "bootstrap data already found and encrypted with different token"
+
+```bash
+sudo journalctl -u k3s --no-pager -n 20
+# level=fatal msg="Error: starting kubernetes: failed to start cluster:
+#   bootstrap data already found and encrypted with different token"
+```
+
+This is a **clean, expected failure**, not a crash — k3s detected that the
+etcd datastore already holds bootstrap data (CA certs, cluster secrets)
+encrypted with a token from a *different* install attempt (e.g. a previous
+test run, or a `--role first` retry after etcd wasn't actually wiped — see
+"etcd data wipe silently does nothing" above). It refuses to proceed rather
+than risk corrupting existing cluster data.
+
+**Fix:** the datastore needs a real wipe, not just a k3s-side reset:
+```bash
+# On the etcd node
+sudo ./rollback.sh --etcd --force
+
+# On the control plane node
+sudo rm -rf /var/lib/rancher/k3s /etc/rancher/k3s
+sudo rm -f /var/log/k3s-install/.ha-server-steps
+sudo ./install-k3s-ha-server.sh --role first ...
 ```
 
 ### cp-2 token rejected
@@ -1246,4 +1430,532 @@ sudo ./scripts/install-cilium.sh --server-ip 192.168.64.21
 sudo ./scripts/validate-cluster.sh \
   --server-ip 192.168.64.21 \
   --skip-connectivity-test
+```
+
+---
+
+---
+
+# Option B — K3s HA Cluster with Embedded etcd (No Dedicated etcd Node)
+
+> Use this setup when you want a simpler HA cluster without managing a separate etcd VM.
+> K3s runs etcd **embedded inside each control plane node**. No external etcd required.
+
+---
+
+## Option B: Architecture
+
+```
+          ┌────────────────────────────────────────────────────────────┐
+          │                  Air-Gapped Network                         │
+          │                                                            │
+          │  ┌─────────────────────────────────────────────────┐      │
+          │  │           nginx Load Balancer (optional)         │      │
+          │  │           192.168.64.20                         │      │
+          │  │           Forwards :6443 → CP-1 or CP-2         │      │
+          │  └──────────────────┬──────────────────────────────┘      │
+          │                     │                                       │
+          │         ┌───────────┴─────────────┐                        │
+          │         │                         │                        │
+          │  ┌──────▼──────────┐     ┌────────▼────────┐              │
+          │  │  Control Plane 1 │◄───►│  Control Plane 2 │             │
+          │  │  192.168.64.21  │     │  192.168.64.22  │              │
+          │  │  k3s server     │     │  k3s server     │              │
+          │  │  + etcd         │     │  + etcd         │              │
+          │  │  (embedded)     │     │  (embedded)     │              │
+          │  └──────┬──────────┘     └────────┬────────┘              │
+          │         │                          │                        │
+          │         └──────────┬───────────────┘                       │
+          │                    │ etcd peer port 2380                   │
+          │                    │ (CP nodes sync between themselves)    │
+          │                                                            │
+          │  ┌──────────────────────────────────────────────────┐     │
+          │  │                  Worker Nodes                     │     │
+          │  │ worker-01        worker-02        worker-03      │     │
+          │  │ 192.168.64.31   192.168.64.32   192.168.64.33   │     │
+          │  │ k3s agent       k3s agent       k3s agent       │     │
+          │  └──────────────────────────────────────────────────┘     │
+          │                                                            │
+          │  ══════════════ WireGuard Encrypted Overlay ═══════════   │
+          └────────────────────────────────────────────────────────────┘
+```
+
+**Key difference from Option A:** etcd is embedded inside each K3s control plane node.
+No separate etcd VM is needed. The two CP nodes form an etcd cluster between themselves
+using port `2380`. This saves 1 VM but ties etcd availability to the control planes.
+
+---
+
+## Option B: VM Requirements
+
+| VM | Hostname | IP | RAM | CPU | Disk | Role |
+|----|----------|----|-----|-----|------|------|
+| cp-1 | cp-1 | 192.168.64.21 | 4 GB | 4 | 30 GB | K3s CP + embedded etcd (first) |
+| cp-2 | cp-2 | 192.168.64.22 | 4 GB | 4 | 30 GB | K3s CP + embedded etcd (additional) |
+| lb | lb-node | 192.168.64.20 | 1 GB | 1 | 10 GB | nginx load balancer (optional) |
+| worker-01 | worker-01 | 192.168.64.31 | 4 GB | 2 | 30 GB | K3s worker |
+| worker-02 | worker-02 | 192.168.64.32 | 4 GB | 2 | 30 GB | K3s worker |
+| worker-03 | worker-03 | 192.168.64.33 | 4 GB | 2 | 30 GB | K3s worker |
+
+> **Total: 6 VMs** (1 less than Option A — no dedicated etcd VM).
+> CP nodes need slightly more disk (30 GB) because they store etcd data at
+> `/var/lib/rancher/k3s/server/db/`.
+
+### Additional Ports Required on Control Plane Nodes
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 2379 | TCP | etcd client (embedded — K3s internal only) |
+| 2380 | TCP | etcd peer (CP-to-CP etcd replication) |
+
+---
+
+## Option B: Phase 1 — Distribute Bundle
+
+Transfer bundle to **5 VMs** (no etcd VM):
+
+```bash
+# On internet-connected machine
+scp ./offline-bundle.tar.gz ubuntu@192.168.64.21:/tmp/    # cp-1
+scp ./offline-bundle.tar.gz ubuntu@192.168.64.22:/tmp/    # cp-2
+scp ./offline-bundle.tar.gz ubuntu@192.168.64.31:/tmp/    # worker-01
+scp ./offline-bundle.tar.gz ubuntu@192.168.64.32:/tmp/    # worker-02
+scp ./offline-bundle.tar.gz ubuntu@192.168.64.33:/tmp/    # worker-03
+
+# Extract on EACH VM:
+sudo mkdir -p /opt
+sudo tar -xzf /tmp/offline-bundle.tar.gz -C /opt/
+
+# Transfer scripts to each VM:
+scp -r ./scripts ubuntu@192.168.64.21:/home/ubuntu/
+scp -r ./scripts ubuntu@192.168.64.22:/home/ubuntu/
+scp -r ./scripts ubuntu@192.168.64.31:/home/ubuntu/
+scp -r ./scripts ubuntu@192.168.64.32:/home/ubuntu/
+scp -r ./scripts ubuntu@192.168.64.33:/home/ubuntu/
+```
+
+---
+
+## Option B: Phase 2 — Prepare All Nodes
+
+Run on **cp-1, cp-2, worker-01, worker-02, worker-03**:
+
+```bash
+cd ~/scripts
+sudo ./prepare-node.sh
+```
+
+---
+
+## Option B: Phase 3 — Install First Control Plane (cp-1, cluster-init)
+
+> Run on **cp-1** (192.168.64.21) only.
+> The `--cluster-init` flag tells K3s to bootstrap a new embedded etcd cluster.
+
+```bash
+ssh ubuntu@192.168.64.21
+
+cd ~/scripts
+
+sudo ./install-k3s-ha-server.sh \
+  --role first \
+  --node-ip 192.168.64.21 \
+  --node-name cp-1 \
+  --embedded-etcd \
+  --load-balancer-ip 192.168.64.20
+```
+
+> Skip `--load-balancer-ip` if you are not using a load balancer.
+
+**What it does (embedded etcd mode):**
+- Copies K3s binary + airgap images from bundle
+- Runs `install.sh` with `--cluster-init` (bootstraps embedded etcd cluster)
+- No `--datastore-endpoint` — etcd runs internally at `/var/lib/rancher/k3s/server/db/`
+- Waits for API server to become healthy
+- Configures `kubectl` for `root` and `ubuntu` users
+- Outputs cluster join token
+
+**Expected final output:**
+```
+  ✔ K3s API server healthy via https://192.168.64.21:6443/healthz
+  ✔ Embedded etcd cluster initialized
+
+╔════════════════════════════════════════════════════════╗
+║        HA Cluster Join Information                     ║
+╚════════════════════════════════════════════════════════╝
+
+  Cluster token:
+  K10407c179d...::server:abcdef1234
+
+  Add another control plane:
+  sudo ./install-k3s-ha-server.sh \
+      --role additional \
+      --node-ip <NEW_CP_IP> \
+      --embedded-etcd \
+      --server-ip 192.168.64.21 \
+      --cluster-token 'K10407c179d...::server:abcdef1234'
+
+  Add worker nodes:
+  sudo ./install-k3s-agent.sh \
+      --server-ip 192.168.64.20 \
+      --token 'K10407c179d...::server:abcdef1234' \
+      --node-name worker-01
+```
+
+**Save the token:**
+```bash
+sudo cat /var/log/k3s-install/node-token.txt
+```
+
+**Verify embedded etcd is running:**
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+# Check K3s sees itself as an etcd member
+sudo k3s etcd-snapshot ls
+# Expected: lists any existing snapshots (empty on fresh install is OK)
+
+# Verify API server is up
+kubectl get nodes
+# NAME   STATUS     ROLES                       AGE
+# cp-1   NotReady   control-plane,etcd,master   1m
+```
+
+> Note the `etcd` role in the ROLES column — this confirms embedded etcd is active.
+
+---
+
+## Option B: Phase 4 — Install Second Control Plane (cp-2)
+
+> Run on **cp-2** (192.168.64.22) only.
+> Uses `--server` to join the embedded etcd cluster via cp-1's API server.
+
+```bash
+ssh ubuntu@192.168.64.22
+
+cd ~/scripts
+
+TOKEN="K10407c179d...::server:abcdef1234"   # from Phase 3
+
+sudo ./install-k3s-ha-server.sh \
+  --role additional \
+  --node-ip 192.168.64.22 \
+  --node-name cp-2 \
+  --embedded-etcd \
+  --server-ip 192.168.64.21 \
+  --cluster-token "${TOKEN}" \
+  --load-balancer-ip 192.168.64.20
+```
+
+**Expected final output:**
+```
+  ✔ K3s API server healthy via https://192.168.64.22:6443/healthz
+  ✔ Node 'cp-2' joined embedded etcd cluster
+
+  Current control plane nodes:
+  NAME   STATUS     ROLES                       AGE
+  cp-1   NotReady   control-plane,etcd,master   5m
+  cp-2   NotReady   control-plane,etcd,master   30s
+```
+
+**Verify both CPs on cp-1:**
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+kubectl get nodes -l node-role.kubernetes.io/control-plane
+# Both cp-1 and cp-2 should show ROLES: control-plane,etcd,master
+```
+
+---
+
+## Option B: Phase 5 — Set Up Load Balancer (Optional)
+
+Same as Option A Phase 6 — nginx TCP load balancer forwarding port 6443 to cp-1 and cp-2.
+
+```bash
+ssh ubuntu@192.168.64.20
+
+sudo apt-get install -y nginx   # or from offline bundle packages
+
+sudo tee /etc/nginx/nginx.conf > /dev/null <<'NGINX_EOF'
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+    worker_connections 1024;
+}
+
+stream {
+    upstream k3s_api_servers {
+        server 192.168.64.21:6443;
+        server 192.168.64.22:6443;
+    }
+
+    server {
+        listen 6443;
+        proxy_pass k3s_api_servers;
+        proxy_connect_timeout 5s;
+        proxy_timeout 30s;
+    }
+}
+NGINX_EOF
+
+sudo systemctl enable nginx
+sudo systemctl restart nginx
+
+# Verify:
+curl -sk https://192.168.64.20:6443/healthz
+# ok
+```
+
+---
+
+## Option B: Phase 6 — Install Worker Nodes
+
+Same as Option A Phase 7. Run on **each worker** (all 3 can run in parallel):
+
+```bash
+# Get token from cp-1 (if needed)
+TOKEN=$(ssh ubuntu@192.168.64.21 'sudo cat /var/log/k3s-install/node-token.txt')
+```
+
+### worker-01 (192.168.64.31)
+
+```bash
+ssh ubuntu@192.168.64.31
+cd ~/scripts
+
+sudo ./install-k3s-agent.sh \
+  --server-ip 192.168.64.20 \
+  --token "${TOKEN}" \
+  --node-name worker-01
+```
+
+### worker-02 (192.168.64.32)
+
+```bash
+ssh ubuntu@192.168.64.32
+cd ~/scripts
+
+sudo ./install-k3s-agent.sh \
+  --server-ip 192.168.64.20 \
+  --token "${TOKEN}" \
+  --node-name worker-02
+```
+
+### worker-03 (192.168.64.33)
+
+```bash
+ssh ubuntu@192.168.64.33
+cd ~/scripts
+
+sudo ./install-k3s-agent.sh \
+  --server-ip 192.168.64.20 \
+  --token "${TOKEN}" \
+  --node-name worker-03
+```
+
+**Verify all 5 nodes on cp-1:**
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+kubectl get nodes -o wide
+# NAME        STATUS     ROLES                       AGE
+# cp-1        NotReady   control-plane,etcd,master   15m
+# cp-2        NotReady   control-plane,etcd,master   10m
+# worker-01   NotReady   <none>                      3m
+# worker-02   NotReady   <none>                      2m
+# worker-03   NotReady   <none>                      1m
+```
+
+---
+
+## Option B: Phase 7 — Install Cilium CNI + WireGuard
+
+Identical to Option A Phase 8. Run **once** from **cp-1** after all 5 nodes appear:
+
+```bash
+ssh ubuntu@192.168.64.21
+cd ~/scripts
+
+sudo ./install-cilium.sh --server-ip 192.168.64.21
+```
+
+**Expected final output:**
+```
+  ✔ Cilium DaemonSet: 5/5 pods running
+  ✔ WireGuard interface cilium_wg0 is up
+  ✔ All 5 nodes are Ready
+```
+
+---
+
+## Option B: Phase 8 — Validate Cluster
+
+```bash
+ssh ubuntu@192.168.64.21
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+cd ~/scripts
+sudo ./validate-cluster.sh --server-ip 192.168.64.21
+
+# Expected:
+#   ✔ 13 PASS checks
+#   ✗  0 FAIL checks
+```
+
+---
+
+## Option B: Expected State at Each Phase
+
+| Phase | cp-1 | cp-2 | workers | etcd | Cilium | Nodes Ready |
+|-------|------|------|---------|------|--------|-------------|
+| After Phase 3 | ✔ Running + etcd | ✗ | ✗ | embedded in cp-1 | ✗ | 0/5 |
+| After Phase 4 | ✔ | ✔ Running + etcd | ✗ | embedded in cp-1+cp-2 | ✗ | 0/5 |
+| After Phase 5 | ✔ | ✔ | ✗ | ✔ | ✗ | 0/5 |
+| After Phase 6 | ✔ | ✔ | ✔ Running | ✔ | ✗ | 0/5 |
+| After Phase 7 | ✔ | ✔ | ✔ | ✔ | ✔ Running | **5/5** ✔ |
+| After Phase 8 | ✔ | ✔ | ✔ | ✔ | ✔ | **5/5** ✔ |
+
+---
+
+## Option B: Embedded etcd Backup and Restore
+
+K3s has built-in snapshot support — no external `etcdctl` needed.
+
+### Take a Manual Snapshot (on cp-1)
+
+```bash
+# Create a named snapshot
+sudo k3s etcd-snapshot save --name pre-upgrade-$(date +%Y%m%d)
+
+# List all snapshots
+sudo k3s etcd-snapshot ls
+# NAME                              SIZE    CREATED
+# pre-upgrade-20260417              2.1 MB  2026-04-17T10:00:00Z
+
+# Snapshots are stored at:
+ls /var/lib/rancher/k3s/server/db/snapshots/
+```
+
+### Schedule Automatic Snapshots
+
+```bash
+# Enable scheduled snapshots (every 6 hours, keep last 5)
+sudo tee /etc/rancher/k3s/config.yaml > /dev/null <<'EOF'
+etcd-snapshot-schedule-cron: "0 */6 * * *"
+etcd-snapshot-retention: 5
+etcd-snapshot-dir: /var/lib/rancher/k3s/server/db/snapshots
+EOF
+
+sudo systemctl restart k3s
+```
+
+### Restore from Snapshot
+
+> **Warning:** Restoring stops the cluster. Do this on cp-1 only.
+
+```bash
+# Stop K3s on ALL nodes first
+# On workers:
+sudo systemctl stop k3s-agent
+
+# On cp-2:
+sudo systemctl stop k3s
+
+# On cp-1 — restore:
+sudo k3s server \
+  --cluster-reset \
+  --cluster-reset-restore-path=/var/lib/rancher/k3s/server/db/snapshots/pre-upgrade-20260417
+
+# Start cp-1:
+sudo systemctl start k3s
+
+# Start cp-2:
+sudo systemctl start k3s
+
+# Start workers:
+sudo systemctl start k3s-agent
+```
+
+---
+
+## Option B: Quick Reference Card
+
+```bash
+# ══════════════════════════════════════════
+# INTERNET MACHINE
+# ══════════════════════════════════════════
+./prepare-offline-bundle.sh
+scp offline-bundle.tar.gz ubuntu@192.168.64.{21,22,31,32,33}:/tmp/
+
+# ══════════════════════════════════════════
+# ALL VMs (cp-1, cp-2, workers) — extract + prepare
+# ══════════════════════════════════════════
+sudo tar -xzf /tmp/offline-bundle.tar.gz -C /opt/
+sudo hostnamectl set-hostname <correct-name>
+sudo bash ~/scripts/prepare-node.sh
+sudo bash /opt/offline-bundle/manifests/load-images.sh
+
+# ══════════════════════════════════════════
+# cp-1 (192.168.64.21) — bootstrap embedded etcd cluster
+# ══════════════════════════════════════════
+sudo ./scripts/install-k3s-ha-server.sh \
+  --role first \
+  --node-ip 192.168.64.21 \
+  --node-name cp-1 \
+  --embedded-etcd \
+  --load-balancer-ip 192.168.64.20
+
+TOKEN=$(sudo cat /var/log/k3s-install/node-token.txt)
+echo "Token: ${TOKEN}"
+
+# ══════════════════════════════════════════
+# cp-2 (192.168.64.22) — join embedded etcd cluster
+# ══════════════════════════════════════════
+TOKEN="<paste from cp-1>"
+sudo ./scripts/install-k3s-ha-server.sh \
+  --role additional \
+  --node-ip 192.168.64.22 \
+  --node-name cp-2 \
+  --embedded-etcd \
+  --server-ip 192.168.64.21 \
+  --cluster-token "${TOKEN}" \
+  --load-balancer-ip 192.168.64.20
+
+# ══════════════════════════════════════════
+# lb-node (192.168.64.20) — optional nginx LB
+# ══════════════════════════════════════════
+# (see Phase 5 for full nginx config)
+sudo systemctl enable --now nginx
+
+# ══════════════════════════════════════════
+# worker-01/02/03 (run on each in parallel)
+# ══════════════════════════════════════════
+TOKEN="<paste from cp-1>"
+sudo ./scripts/install-k3s-agent.sh \
+  --server-ip 192.168.64.20 \
+  --token "${TOKEN}" \
+  --node-name worker-01        # change per node
+
+# ══════════════════════════════════════════
+# cp-1 — install Cilium (after all 5 nodes joined)
+# ══════════════════════════════════════════
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+kubectl get nodes   # verify 5 nodes with role: control-plane,etcd,master
+
+sudo ./scripts/install-cilium.sh --server-ip 192.168.64.21
+
+# ══════════════════════════════════════════
+# cp-1 — validate
+# ══════════════════════════════════════════
+sudo ./scripts/validate-cluster.sh \
+  --server-ip 192.168.64.21 \
+  --skip-connectivity-test
+
+# ══════════════════════════════════════════
+# Embedded etcd — snapshot commands
+# ══════════════════════════════════════════
+sudo k3s etcd-snapshot save --name manual-$(date +%Y%m%d)
+sudo k3s etcd-snapshot ls
 ```
